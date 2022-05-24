@@ -1,0 +1,620 @@
+#import libray
+import pandas as pd
+import numpy as np
+import re
+import numpy
+import nltk
+import string
+from io import StringIO
+from gensim.models import Word2Vec
+from gensim.models import word2vec
+from gensim import models
+import gensim
+
+from nltk.tokenize import RegexpTokenizer
+from nltk.stem.porter import PorterStemmer
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+from nltk.stem import PorterStemmer
+from nltk.util import ngrams
+from nltk.tokenize import word_tokenize
+from nltk import word_tokenize
+from nltk import punkt
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+from sklearn.preprocessing import LabelEncoder
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_selection import chi2
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.feature_extraction.text import TfidfTransformer
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import LinearSVC
+from sklearn.model_selection import cross_val_score
+from sklearn.metrics import confusion_matrix
+from sklearn import metrics
+from sklearn.preprocessing import MinMaxScaler
+import pandas.util.testing as tm
+from scipy.sparse import hstack
+from scipy.sparse import csr_matrix
+
+from collections import defaultdict
+from collections import  Counter
+from tqdm import tqdm
+
+from keras.preprocessing.text import Tokenizer
+from keras.preprocessing.sequence import pad_sequences
+from keras.models import Sequential
+from keras.layers import Embedding,LSTM,Dense,SpatialDropout1D
+from keras.initializers import Constant
+#kbh수정
+from tensorflow.keras.optimizers import Adam
+from keras.models import Sequential
+from keras import layers
+from keras import optimizers
+from keras import preprocessing
+from elasticsearch import Elasticsearch
+from pandasticsearch import DataFrame
+
+
+plt.style.use('ggplot')
+stop=set(stopwords.words('english'))
+
+#kbh수정
+data=pd.read_csv('data_dropna.csv')
+
+import nltk
+nltk.download('stopwords')
+
+def data_text_cleaning(x):
+    # 영문자 이외 문자는 공백으로 변환
+    only_english = re.sub('[^a-zA-Z]', ' ', x)
+    # 소문자 변환
+    no_capitals = only_english.lower().split()
+    # 불용어 제거
+    stops = set(stopwords.words('english'))
+    no_stops = [word for word in no_capitals if not word in stops]
+    # 어간 추출
+    stemmer = nltk.stem.SnowballStemmer('english')
+    stemmer_words = [stemmer.stem(word) for word in no_stops]
+    wordnet_lemmatizer = WordNetLemmatizer()
+
+    words = [wordnet_lemmatizer.lemmatize(w) for w in stemmer_words]
+    return words
+
+nltk.download('wordnet')
+
+#kbh수정
+nltk.download('omw-1.4')
+
+
+data["resolutiontext1"] = data["resolutiontext"].apply(lambda x: data_text_cleaning(x))
+data["resolutiontext1"] = data["resolutiontext1"].apply(lambda x: " ".join(str(c) for c in x))
+
+data["servicetext1"] = data["servicetext"].apply(lambda x: data_text_cleaning(str(x)))
+data["servicetext1"] = data["servicetext1"].apply(lambda x: " ".join(str(c) for c in x))
+
+data["escalationtext1"] = data["escalationtext"].apply(lambda x: data_text_cleaning(str(x)))
+data["escalationtext1"] = data["escalationtext1"].apply(lambda x: " ".join(str(c) for c in x))
+
+# 문장에 있는 동사를 이용해 진짜일 확률이 높은 문장들만 골라냅니다.
+data_list = []
+data_list.append(data[(data['Action']=='(RE) CONFIGURED/PROGRAMMED/RESET')&
+     (data["resolutiontext1"].str.contains("adjust|reset|setup|configur|recov|reboot|initi|pwer|cycl|reimg|firmwar", 
+                                          na=False))])
+data_list.append(data[(data['Action']=='ADJUSTED/CALIBRATED')&
+     (data["resolutiontext1"].str.contains("adjust|level|reteach|calibr|algin|recalibr", 
+                                          na=False))])
+data_list.append(data[(data['Action']=='CLEANED')&
+     (data["resolutiontext1"].str.contains("CLEAN|clean|particl", 
+                                          na=False))])
+data_list.append(data[(data['Action']=='REPAIRED')&
+     (data["resolutiontext1"].str.contains("REPAIR|repair", 
+                                          na=False))])
+data_list.append(data[(data['Action']=='REPLACED WITH SAME PART')&
+     (data["resolutiontext1"].str.contains("replac", 
+                                          na=False))])
+data_list.append(data[(data['Action']=='REPLACED WITH DIFFERENT PART')&
+     (data["resolutiontext1"].str.contains("replac", 
+                                          na=False))])
+# 카테고리별로 진짜 문장들을 골라낸 것들을 하나의 테이블로 만듭니다.
+dfs = pd.concat(data_list,axis=0)
+
+# 불필요한 카테고리의 수를 제거 및 통합하여 개수를 줄입니다.
+dfs.loc[dfs['Action']=='REPLACED WITH SAME PART','Action'] = 'REPLACED'
+dfs.loc[dfs['Action']=='REPLACED WITH DIFFERENT PART','Action'] = 'REPLACED'
+dfs = dfs.loc[dfs['Action']!='VERIFIED']
+dfs = dfs.loc[dfs['Escalation Reason']!='Part Number Needed']
+
+# 카테고리를 숫자화시켜줍니다.
+dfs['category_id']=dfs['Action'].factorize()[0]
+category_id_df = dfs[['Action', 'category_id']].drop_duplicates().sort_values('category_id')
+category_to_id = dict(category_id_df.values)
+id_to_category = dict(category_id_df[['category_id', 'Action']].values)
+
+encoder = LabelEncoder()
+encoder.fit(dfs.Action)
+dfs['Action_label'] = encoder.transform(dfs.Action)
+
+'''
+진행한 방식은 resolution text을 전처리하고, 파생변수를 생성하였습니다.
+
+특정 패턴을 바꾸었습니다.
+
+won't, can't .. 부정문의 축약을 알기 쉽게 두 단어로 변형시켰습니다.
+특수 문자를 제거하였습니다.
+
+\t,\n,..
+새로운 변수를 생성하였습니다.
+
+문장의 길이, 대문자의 갯수(대문자로 쓰인 단어의 중요성 여부)
+'''
+
+# dfs check
+import matplotlib.pyplot as plt
+fig = plt.figure(figsize=(8,6))
+dfs.groupby('Action').resolutiontext.count().plot.bar(ylim=0)
+plt.show()
+
+# 위의 1번에 대한 코드입니다.
+cont_patterns = [
+    (b'(W|w)on\'t', b'will not'),
+    (b'(C|c)an\'t', b'can not'),
+    (b'(I|i)\'m', b'i am'),
+    (b'(A|a)in\'t', b'is not'),
+    (b'(\w+)\'ll', b'\g<1> will'),
+    (b'(\w+)n\'t', b'\g<1> not'),
+    (b'(\w+)\'ve', b'\g<1> have'),
+    (b'(\w+)\'s', b'\g<1> is'),
+    (b'(\w+)\'re', b'\g<1> are'),
+    (b'(\w+)\'d', b'\g<1> would'),
+]
+patterns = [(re.compile(regex), repl) for (regex, repl) in cont_patterns]
+
+# 위의 2번에 대한 코드입니다.
+def prepare_for_char_n_gram(text):
+    clean = bytes(text.lower(), encoding="utf-8")
+    clean = clean.replace(b"\n", b" ")
+    clean = clean.replace(b"\t", b" ")
+    clean = clean.replace(b"\b", b" ")
+    clean = clean.replace(b"\r", b" ")
+    clean = clean.replace(b"fix", b" ")
+    clean = clean.replace(b"part", b" ")
+    clean = clean.replace(b"number", b" ")
+     
+    for (pattern, repl) in patterns:
+        clean = re.sub(pattern, repl, clean)
+    
+    clean = re.sub(b"\d+", b" ", clean)
+    return str(clean, 'utf-8')
+
+def count_regexp_occ(regexp="", text=None):
+    return len(re.findall(regexp, text))
+
+
+# 위의 3번에 대한 코드입니다.
+def get_indicators_and_clean_comments(df):
+    # \n 의 갯수 세기
+    df["ant_slash_n"] = df["resolutiontext"].apply(lambda x: count_regexp_occ(r"\n", x))
+    # 단어와 문자의 갯수 세기
+    df["raw_word_len"] = df["resolutiontext"].apply(lambda x: len(x.split()))
+    df["raw_char_len"] = df["resolutiontext"].apply(lambda x: len(x))
+    # 대문자의 갯수 세기
+    df["nb_upper"] = df["resolutiontext"].apply(lambda x: count_regexp_occ(r"[A-Z]", x))
+    # 실제 prepare_for_char_n_gram으로 문장 전처리
+    df["clean_comment"] = df["resolutiontext"].apply(lambda x: prepare_for_char_n_gram(x))
+    df["clean_comment1"] = df["escalationtext"].astype(str).apply(lambda x: prepare_for_char_n_gram(x))
+    df["clean_comment2"] = df["servicetext"].astype(str).apply(lambda x: prepare_for_char_n_gram(x))
+
+get_indicators_and_clean_comments(dfs)
+num_features = ["ant_slash_n","raw_word_len","raw_char_len","nb_upper"]
+skl = MinMaxScaler()
+dfs_num_features = csr_matrix(skl.fit_transform(dfs[num_features]))
+
+#data seperate
+text1=dfs.clean_comment.values.astype('U')
+Action1=dfs.Action.values.astype('U')
+
+#setup TF-IDF vectorizer
+tfidf = TfidfVectorizer(min_df = 5, analyzer = 'word',ngram_range = (1, 1),max_features = 280)
+features = tfidf.fit_transform(text1).toarray()
+labels = dfs.category_id
+features.shape
+
+
+N = 2
+for Action, category_id in sorted(category_to_id.items()):
+    features_chi2 = chi2(features, labels == category_id)
+    indices = np.argsort(features_chi2[0])
+    feature_names = np.array(tfidf.get_feature_names())[indices]
+    unigrams = [v for v in feature_names if len(v.split(' ')) == 1]
+    bigrams = [v for v in feature_names if len(v.split(' ')) == 2]
+    print("# '{}':".format(Action))
+    print("  . Most correlated unigrams:\n. {}".format('\n. '.join(unigrams[-N:])))
+    
+nltk.download('averaged_perceptron_tagger')
+
+def build_dictionary(sentence):
+    dictionary = {}
+    for sent in sentence:
+        pos_tags = nltk.pos_tag(nltk.word_tokenize(sent))
+        for tag in pos_tags:
+            value = tag[0]
+            pos = tag[1]
+            dictionary[value] = pos
+    return dictionary
+
+def data_text_cleaning(data):
+    # 영문자 이외 문자는 공백으로 변환
+    only_english = re.sub('[^a-zA-Z]', ' ', data)
+
+    # 소문자 변환
+    no_capitals = only_english.lower().split()
+
+    # 불용어 제거
+    stops = set(stopwords.words('english'))
+    no_stops = [word for word in no_capitals if not word in stops]
+
+    # 어간 추출
+    stemmer = nltk.stem.SnowballStemmer('english')
+    stemmer_words = [stemmer.stem(word) for word in no_stops]
+    wordnet_lemmatizer = WordNetLemmatizer()
+
+    li =[]
+    words = [wordnet_lemmatizer.lemmatize(w) for w in stemmer_words]
+    li.append(" ".join(str(x) for x in words))
+    pos_dict = build_dictionary(li)
+    nouns = [n for n, tag in pos_dict.items() if tag in ["NN","NNP"] ]
+    verbs = [n for n, tag in pos_dict.items() if tag in ["JJ","VBZ","VB"] ]
+    return [nouns,verbs]
+
+nltk.download('wordnet')
+a = dfs.resolutiontext.apply(lambda x: data_text_cleaning(x)[0])
+b = dfs.resolutiontext.apply(lambda x: data_text_cleaning(x)[1])
+
+dfs['nouns'] = a
+dfs['verbs'] = b
+
+# 단어들의 갯수를 계산하기 위한 함수
+def create_corpus(target, text):
+    corpus=[]
+    
+    for x in dfs[dfs['Action']==target][text]:
+        for i in x:
+            corpus.append(i)
+    return corpus
+
+dfs.Action.unique()
+
+# 저장한 명사들을 이용해 카테고리별 빈출단어들을 살펴봅니다.
+# create_corpus('REPAIRED','nouns') 여기에서 첫번째 인자인 'REPAIRED'를 원하는 카테고리로 교체 가능합니다.
+# 저장한 명사들을 이용해 카테고리별 빈출단어들을 살펴봅니다.
+# create_corpus('REPAIRED','nouns') 여기에서 첫번째 인자인 'REPAIRED'를 원하는 카테고리로 교체 가능합니다.
+corpus=create_corpus('REPLACED','nouns')
+counter=Counter(corpus)
+most=counter.most_common()
+x=[]
+y=[]
+for word,count in most[:40]:
+    if (word not in stop) :
+        x.append(word)
+        y.append(count)
+plt.figure(figsize=(15,15))
+sns.barplot(x=y,y=x)
+plt.title('replace')
+plt.show()
+
+#REPAIRED
+corpus=create_corpus('REPAIRED','nouns')
+counter=Counter(corpus)
+most=counter.most_common()
+x=[]
+y=[]
+for word,count in most[:40]:
+    if (word not in stop) :
+        x.append(word)
+        y.append(count)
+plt.figure(figsize=(15,15))
+sns.barplot(x=y,y=x)
+plt.title('repaired')
+plt.show()
+
+#CONFIGURED / RESET
+corpus=create_corpus('(RE) CONFIGURED/PROGRAMMED/RESET','nouns')
+counter=Counter(corpus)
+most=counter.most_common()
+x=[]
+y=[]
+for word,count in most[:40]:
+    if (word not in stop) :
+        x.append(word)
+        y.append(count)
+plt.figure(figsize=(15,15))
+sns.barplot(x=y,y=x)
+plt.title('configured/reset')
+plt.show()
+
+#ADJUSTED/CALIBRATED
+corpus=create_corpus('ADJUSTED/CALIBRATED','nouns')
+counter=Counter(corpus)
+most=counter.most_common()
+x=[]
+y=[]
+for word,count in most[:40]:
+    if (word not in stop) :
+        x.append(word)
+        y.append(count)
+plt.figure(figsize=(15,15))
+sns.barplot(x=y,y=x)
+plt.title('adjust/calibrated')
+plt.show()
+
+#CLEANED
+corpus=create_corpus('CLEANED','nouns')
+counter=Counter(corpus)
+most=counter.most_common()
+x=[]
+y=[]
+for word,count in most[:40]:
+    if (word not in stop) :
+        x.append(word)
+        y.append(count)
+plt.figure(figsize=(15,15))
+sns.barplot(x=y,y=x)
+plt.title('cleaned')
+plt.show()
+
+#저장한 동사들을 이용해 카테고리별 빈출단어들을 살펴봅니다.
+corpus=create_corpus('REPLACED','verbs')
+counter=Counter(corpus)
+most=counter.most_common()
+x=[]
+y=[]
+for word,count in most[:40]:
+    if (word not in stop) :
+        x.append(word)
+        y.append(count)
+plt.figure(figsize=(15,15))
+sns.barplot(x=y,y=x)
+plt.title('replace')
+plt.show()
+
+#REPAIRED
+corpus=create_corpus('REPAIRED','verbs')
+counter=Counter(corpus)
+most=counter.most_common()
+x=[]
+y=[]
+for word,count in most[:40]:
+    if (word not in stop) :
+        x.append(word)
+        y.append(count)
+plt.figure(figsize=(15,15))
+sns.barplot(x=y,y=x)
+plt.title('repaired')
+plt.show()
+
+#CONFIGURED / RESET
+corpus=create_corpus('(RE) CONFIGURED/PROGRAMMED/RESET','verbs')
+counter=Counter(corpus)
+most=counter.most_common()
+x=[]
+y=[]
+for word,count in most[:40]:
+    if (word not in stop) :
+        x.append(word)
+        y.append(count)
+plt.figure(figsize=(15,15))
+sns.barplot(x=y,y=x)
+plt.title('configured/reset')
+plt.show()
+
+#ADJUSTED/CALIBRATED
+corpus=create_corpus('ADJUSTED/CALIBRATED','verbs')
+counter=Counter(corpus)
+most=counter.most_common()
+x=[]
+y=[]
+for word,count in most[:40]:
+    if (word not in stop) :
+        x.append(word)
+        y.append(count)
+plt.figure(figsize=(15,15))
+sns.barplot(x=y,y=x)
+plt.title('adjust/calibrated')
+plt.show()
+
+#CLEANED
+corpus=create_corpus('CLEANED','verbs')
+counter=Counter(corpus)
+most=counter.most_common()
+x=[]
+y=[]
+for word,count in most[:40]:
+    if (word not in stop) :
+        x.append(word)
+        y.append(count)
+plt.figure(figsize=(15,15))
+sns.barplot(x=y,y=x)
+plt.title('cleaned')
+plt.show()
+'''
+다양한 방법으로 임베딩한 후 모델 성능을 비교하는 코드입니다.
+tfidf/word2vec/glove 각각 xgboost로 비교
+'''
+# 문장별로 tfidf로 임베딩한 후에 성능을 비교합니다.
+
+final_result = []
+for i,name in zip(['clean_comment','clean_comment1','clean_comment2'],['resolutiontext','escalationtext','servicetext']):
+    tfidf_transformer= TfidfVectorizer(min_df = 5,
+                                       analyzer = 'word',
+                                       ngram_range = (1, 1),
+                                       max_features = 280)
+    X = tfidf_transformer.fit_transform(dfs[i]).toarray()
+    X1 = pd.DataFrame(X)
+    X1['col1'] = dfs['raw_word_len']
+    X1['col2'] = dfs['raw_char_len']
+    X1['col3'] = dfs['nb_upper']
+    X1 = X1.fillna(0)
+    y = dfs['Action_label'].values
+    X_train, X_test, y_train, y_test = train_test_split(X1, y, test_size=0.3, random_state=0, stratify = y)
+
+    # Setting some parameters
+    rf = RandomForestClassifier(n_estimators=200, max_depth=3, random_state=0)
+    svm = LinearSVC()
+    nb = MultinomialNB()
+    lg = LogisticRegression(random_state=0)
+    parameters = {
+        'n_estimators' : 300,
+        'learning_rate' : 0.1,
+        'eta': 0.3,  
+        'silent': True,  # option for logging
+        'objective': 'multi:softprob',  # error evaluation for multiclass tasks
+        'num_class': 5,  # number of classes to predic
+        'max_depth': 5  # depth of the trees in the boosting process
+        }  
+    num_round = 100  # the number of training iterations
+
+    dtrain = xgb.DMatrix(X_train, label=y_train)
+    dtest = xgb.DMatrix(X_test, label=y_test)
+
+    #training the model
+    bst = xgb.train(parameters, dtrain, num_round)
+    rf.fit(X_train,y_train)
+    svm.fit(X_train,y_train)
+    #nb.fit(X_train,y_train)
+    lg.fit(X_train,y_train)
+    #result
+    result = []
+    
+    preds = bst.predict(dtest)
+    preds_rf = rf.predict(X_test)
+    preds_svm = svm.predict(X_test)
+    #preds_nb = nb.predict(X_test)
+    preds_lg = lg.predict(X_test)
+
+    best_preds = np.asarray([np.argmax(line) for line in preds])
+
+
+    result.append(accuracy_score(y_test, best_preds))
+    result.append(accuracy_score(y_test, preds_rf))
+    result.append(accuracy_score(y_test, preds_svm))
+    #result.append(accuracy_score(y_test, preds_nb))
+    result.append(accuracy_score(y_test, preds_lg))
+    
+    final_result.append(result)
+result_df = pd.DataFrame(final_result, columns = ['xgboost','rf','svm','logistic']
+             , index = ['resolutiontext','escalationtext','servicetext'])
+
+print('accuracy score')
+result_df
+
+# 문장별로 word2vec로 임베딩한 후에 성능을 비교합니다.
+# 기존에 훈련된 워드투벡터 모델을 이용합니다.
+# 이 word2vec 파일은 지금 실행하는 주피터노트북 파일과 같은 곳에 두시면 됩니다.
+
+w = models.KeyedVectors.load_word2vec_format(
+    'GoogleNews-vectors-negative300.bin.gz', binary=True)
+w.init_sims(replace=True)
+
+# 워드투벡터로 임베딩하는 코드입니다.
+def w2v_tokenize_text(text):
+    tokens = []
+    for sent in nltk.sent_tokenize(text, language='english'):
+        for word in nltk.word_tokenize(sent, language='english'):
+            if len(word) < 2:
+                continue
+            tokens.append(word)
+    return tokens
+
+def word_averaging(wv, words):
+    all_words, mean = set(), []
+    
+    for word in words:
+        if isinstance(word, np.ndarray):
+            mean.append(word)
+        elif word in wv.vocab:
+            mean.append(wv.syn0norm[wv.vocab[word].index])
+            all_words.add(wv.vocab[word].index)
+
+    if not mean:
+        return np.zeros(wv.vector_size,)
+
+    mean = gensim.matutils.unitvec(np.array(mean).mean(axis=0)).astype(np.float32)
+    return mean
+
+def  word_averaging_list(wv, text_list):
+    return np.vstack([word_averaging(wv, post) for post in text_list ])
+
+
+final_result = []
+
+for i,name in zip(['clean_comment','clean_comment1','clean_comment2'],['resolutiontext','escalationtext','servicetext']):
+
+    train_tokenized = dfs.apply(lambda r: w2v_tokenize_text(r[i]), axis=1).values
+    X_train_word_average = word_averaging_list(w,train_tokenized)
+    X1 = pd.DataFrame(X_train_word_average)
+    X1 = X1.fillna(0)
+    y = dfs['Action_label'].values
+    X_train, X_test, y_train, y_test = train_test_split(X1, y, test_size=0.3, random_state=0, stratify = y)
+
+    # Setting some parameters
+    rf = RandomForestClassifier(n_estimators=200, max_depth=3, random_state=0)
+    svm = LinearSVC()
+    #nb = MultinomialNB()
+    lg = LogisticRegression(random_state=0)
+    parameters = {
+        'n_estimators' : 300,
+        'learning_rate' : 0.1,
+        'eta': 0.3,  
+        'silent': True,  # option for logging
+        'objective': 'multi:softprob',  # error evaluation for multiclass tasks
+        'num_class': 5,  # number of classes to predic
+        'max_depth': 5  # depth of the trees in the boosting process
+        }  
+    num_round = 100  # the number of training iterations
+
+    dtrain = xgb.DMatrix(X_train, label=y_train)
+    dtest = xgb.DMatrix(X_test, label=y_test)
+
+    #training the model
+    bst = xgb.train(parameters, dtrain, num_round)
+    rf.fit(X_train,y_train)
+    svm.fit(X_train,y_train)
+    #nb.fit(X_train,y_train)
+    lg.fit(X_train,y_train)
+    #result
+    result = []
+    
+    preds = bst.predict(dtest)
+    preds_rf = rf.predict(X_test)
+    preds_svm = svm.predict(X_test)
+    #preds_nb = nb.predict(X_test)
+    preds_lg = lg.predict(X_test)
+
+    best_preds = np.asarray([np.argmax(line) for line in preds])
+
+
+    result.append(accuracy_score(y_test, best_preds))
+    result.append(accuracy_score(y_test, preds_rf))
+    result.append(accuracy_score(y_test, preds_svm))
+    #result.append(accuracy_score(y_test, preds_nb))
+    result.append(accuracy_score(y_test, preds_lg))
+    
+    final_result.append(result)
+result_df = pd.DataFrame(final_result, columns = ['xgboost','rf','svm','logistic']
+             , index = ['resolutiontext','escalationtext','servicetext'])
+
+print('accuracy score')
+result_df
+
+
+
+
