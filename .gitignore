@@ -2,3 +2,4 @@
 .vscode
 glove.6B.100d.txt
 *.csv
+src/ted_en-20160408.xml
