@@ -6,3 +6,7 @@ src/ted_en-20160408.xml
 src/eng_w2v
 src/ratings.txt
 src/word2vec.ipynb
+src/glove.6B.zip
+src/glove.6B.300d.txt
+src/glove.6B.200d.txt
+src/glove.6B.50d.txt
