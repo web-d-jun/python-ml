@@ -13,3 +13,6 @@ src/glove.6B.50d.txt
 src/keras/PetImages
 src/beginner/input/image_class_labels.txt
 src/beginner/input/image_attribute_labels.txt
+src/beginner/input/certainties.txt
+.gitignore
+src/beginner/input/class_attribute_labels_continuous.txt
